@@ -8,8 +8,8 @@ This module:
 - Builds model pipelines (LogReg, RandomForest, XGBoost)
 - Runs cross-validated evaluation (no data leakage)
 - Optional hold-out evaluation with confusion matrix + classification report
-- NEW: ROC curve plotting for all models
-- NEW: PCA 2D projection of numeric features
+- Plots ROC curves for all models
+- Plots PCA 2D projection of numeric features
 """
 
 # ------------------------- Imports -------------------------
@@ -48,7 +48,8 @@ import matplotlib.pyplot as plt                               # For plotting cur
 
 # ------------------------- Scorers -------------------------
 
-# Build a dictionary of evaluation metrics using scikit-learn scorers
+# Build a dictionary of evaluation metrics using scikit-learn scorers.
+# We use these names in cross_validate() so it returns test_accuracy, test_precision, etc.
 SCORERS = {
     name: get_scorer(name)
     for name in ["accuracy", "precision", "recall", "f1"]     # Metrics we care about
@@ -70,44 +71,43 @@ def _detect_columns(df: pd.DataFrame, label_hint: str = "label"):
         text_col (str or None): Name of the text column used for TF-IDF (e.g. description).
         num_cols (list[str]): List of numeric feature column names.
     """
-    # Candidate label column names in priority order
+    # Candidate label column names in priority order.
+    # We pick the first one that actually exists.
     label_candidates = [label_hint, "is_bot", "bot", "target", "is_fake"]
 
-    # Initialize label column as None
-    y_col = None
+    y_col = None  # will store the chosen label column name
 
-    # Check which candidate actually exists in the DataFrame
     for c in label_candidates:
         if c in df.columns:
             y_col = c
             break
 
-    # If no label column was found, raise an error
+    # If no label column was found at all, stop with a clear error message.
     if y_col is None:
         raise ValueError(
             f"No label column found (expected one of: {', '.join(label_candidates)})."
         )
 
-    # Candidate text columns to use for TF-IDF
+    # Candidate text columns to use for TF-IDF.
     text_candidates = ["description", "bio", "text", "tweet_text"]
 
-    # Initialize text column as None
-    text_col = None
+    text_col = None  # will store the chosen text column name (if any)
 
-    # Pick the first text-like column that exists
     for c in text_candidates:
         if c in df.columns:
             text_col = c
             break
 
-    # Build list of numeric columns: all numeric dtypes except label + text
-    exclude = [y_col] + ([text_col] if text_col else [])      # columns we must not treat as numeric
+    # Build list of numeric columns:
+    # - all numeric dtypes
+    # - excluding the label column
+    # - excluding the text column (if present)
+    exclude = [y_col] + ([text_col] if text_col else [])
     num_cols = [
         c for c in df.columns
         if c not in exclude and pd.api.types.is_numeric_dtype(df[c])
     ]
 
-    # Return detected column names
     return y_col, text_col, num_cols
 
 
@@ -126,25 +126,27 @@ def _preprocessor(num_cols, text_col):
     Returns:
         ColumnTransformer: combined preprocessing step
     """
-    # List of (name, transformer, columns) tuples
+    # List of (name, transformer, columns) tuples passed to ColumnTransformer.
     transformers = []
 
-    # If we have numeric columns, scale them with StandardScaler
+    # If we have numeric columns, scale them with StandardScaler.
+    # with_mean=False keeps it compatible with sparse outputs from TF-IDF.
     if num_cols:
         transformers.append(
             ("num", StandardScaler(with_mean=False), num_cols)
         )
 
-    # If we have a text column, apply TF-IDF on it
+    # If we have a text column, apply TF-IDF on it.
+    # ColumnTransformer will pass this column as a 1D array/Series to TfidfVectorizer.
     if text_col:
         transformers.append(
             ("txt", TfidfVectorizer(max_features=1000, stop_words="english"), text_col)
         )
 
     # Build the ColumnTransformer:
-    # - apply transformers only to specified columns
-    # - drop anything else (no remainder columns)
-    # - sparse_threshold controls when it returns sparse vs dense matrix
+    # - apply specified transformers
+    # - drop any other columns
+    # - sparse_threshold controls when it returns sparse vs dense matrices
     return ColumnTransformer(
         transformers=transformers,
         remainder="drop",
@@ -166,21 +168,21 @@ def build_cv_pipelines(num_cols, text_col):
     Returns:
         dict[str, Pipeline]: dictionary of model_name -> full pipeline
     """
-    # Shared preprocessing (scaling + TF-IDF)
+    # Shared preprocessing (scaling + TF-IDF).
     pre = _preprocessor(num_cols, text_col)
 
-    # Define the classifiers we want to test
+    # Define the classifiers we want to test.
     models = {
-        # Logistic Regression: linear baseline, good as a reference model
+        # Logistic Regression: linear baseline, good as a reference model.
         "logreg": LogisticRegression(max_iter=500),
 
-        # Random Forest: ensemble of decision trees, handles nonlinear patterns
+        # Random Forest: ensemble of decision trees, handles nonlinear patterns and interactions.
         "rf": RandomForestClassifier(
             n_estimators=300,
             random_state=42
         ),
 
-        # XGBoost: gradient boosting on decision trees, strong for tabular data
+        # XGBoost: gradient boosting on decision trees, strong for tabular data.
         "xgb": XGBClassifier(
             n_estimators=400,
             max_depth=6,
@@ -193,7 +195,7 @@ def build_cv_pipelines(num_cols, text_col):
         ),
     }
 
-    # Wrap each model with the preprocessor into a Pipeline
+    # Wrap each model with the preprocessor into a single sklearn Pipeline.
     pipelines = {
         name: Pipeline([("pre", pre), ("clf", model)])
         for name, model in models.items()
@@ -223,10 +225,11 @@ def cv_evaluate(df: pd.DataFrame, label_col: str = "label"):
     Returns:
         dict: { model_name: { metric_name: (mean, std), ... }, ... }
     """
-    # 1. Detect label, text, numeric columns
+    # 1. Detect label, text, numeric columns.
     y_col, text_col, num_cols = _detect_columns(df, label_hint=label_col)
 
-    # 2. Build feature matrix X from numeric + optional text column
+    # 2. Build feature matrix X from numeric + optional text column.
+    # We explicitly choose only the numeric columns + the text column (if any).
     X = df[[*(num_cols), *( [text_col] if text_col else [] )]].copy()
 
     # --- Text cleaning: TF-IDF cannot handle NaN, so fill with "" and cast to str ---
@@ -235,39 +238,75 @@ def cv_evaluate(df: pd.DataFrame, label_col: str = "label"):
 
     # --- Numeric cleaning: many models cannot handle NaN, so we coerce + fill ---
     if num_cols:
-        # Convert values to numeric; invalid strings become NaN
+        # Convert values to numeric; any invalid strings become NaN.
         for col in num_cols:
             X[col] = pd.to_numeric(X[col], errors="coerce")
-        # Replace any remaining NaNs with 0
+
+        # Replace any remaining NaNs with 0.
         X[num_cols] = X[num_cols].fillna(0)
 
-    # 3. Build label vector y as integer
+    # 3. Build label vector y as integer array.
     y = df[y_col].astype(int).values
 
-    # 4. Configure Stratified K-Fold CV
-    if len(np.unique(y)) > 1:
-        # Count how many samples per class
-        class_counts = np.bincount(y)
-        # Minimum class size (ignoring zero counts)
-        min_class = int(class_counts[class_counts > 0].min())
-        # Number of splits: at most 5, cannot exceed smallest class size or total samples
-        n_splits = max(2, min(5, min_class, len(y)))
-        # Build StratifiedKFold to preserve class balance in each fold
-        cv = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
-    else:
-        # Degenerate case: only one class (should not happen in real use)
-        n_splits = 2
-        cv = n_splits
+    # 4. Configure Stratified K-Fold CV SAFELY (this is where your error came from).
+    #
+    # We must ensure:
+    #   - There are at least 2 classes (0 and 1)
+    #   - Each class has at least 2 samples if we want n_splits >= 2
+    #   - n_splits never exceeds the smallest class size or total samples
+    unique_classes, counts = np.unique(y, return_counts=True)
 
-    # 5. Build pipelines for each model
+    # If there is only one class, classification is meaningless.
+    if len(unique_classes) < 2:
+        raise ValueError(
+            "cv_evaluate: need at least 2 different classes for classification "
+            f"but found {len(unique_classes)} unique value(s): {unique_classes.tolist()}."
+        )
+
+    # Smallest class size (e.g., min(#bots, #genuine)).
+    min_class = int(counts.min())
+
+    # Also check overall sample size.
+    total_samples = len(y)
+
+    # If the smallest class has < 2 samples, we cannot do stratified CV with >=2 splits.
+    if min_class < 2 or total_samples < 2:
+        raise ValueError(
+            "cv_evaluate: not enough data to run stratified cross-validation.\n"
+            f"Total samples: {total_samples}, smallest class size: {min_class}.\n"
+            "StratifiedKFold requires at least 2 samples in EACH class. "
+            "Please use a larger dataset or switch to a simple train/test split (e.g. holdout_evaluate)."
+        )
+
+    # Choose number of folds:
+    # - Max 5 folds for stability.
+    # - Cannot exceed the smallest class size.
+    # - Cannot exceed total number of samples.
+    n_splits = min(5, min_class, total_samples)
+
+    # Extra safety: n_splits must be at least 2.
+    if n_splits < 2:
+        raise ValueError(
+            f"cv_evaluate: computed n_splits={n_splits}, which is invalid. "
+            "Need at least 2 folds. Check class distribution and dataset size."
+        )
+
+    # Build StratifiedKFold to preserve class balance in each fold.
+    cv = StratifiedKFold(
+        n_splits=n_splits,
+        shuffle=True,
+        random_state=42,
+    )
+
+    # 5. Build pipelines for each model.
     pipes = build_cv_pipelines(num_cols, text_col)
 
-    # Dictionary to hold summary stats per model
+    # Dictionary to hold summary stats per model.
     summaries = {}
 
-    # 6. Run cross-validation for each model pipeline
+    # 6. Run cross-validation for each model pipeline.
     for name, pipe in pipes.items():
-        # cross_validate returns dict of arrays: test_accuracy, test_precision, ...
+        # cross_validate returns a dict of arrays: test_accuracy, test_precision, etc.
         scores = cross_validate(
             pipe,                # pipeline (preprocessing + classifier)
             X,                   # feature matrix (cleaned)
@@ -277,17 +316,17 @@ def cv_evaluate(df: pd.DataFrame, label_col: str = "label"):
             error_score=np.nan,  # if a fold crashes, store NaN instead of raising
         )
 
-        # For each test_* metric, compute mean and std across folds
+        # For each "test_*" metric, compute mean and std across folds.
         summaries[name] = {
             metric.replace("test_", ""): (
-                float(np.nanmean(scores[metric])),
-                float(np.nanstd(scores[metric]))
+                float(np.nanmean(scores[metric])),   # mean score across folds
+                float(np.nanstd(scores[metric]))     # standard deviation across folds
             )
             for metric in scores
             if metric.startswith("test_")
         }
 
-    # Return nested dict of metrics
+    # Return nested dict of metrics, ready for printing in main.py.
     return summaries
 
 
@@ -307,31 +346,31 @@ def holdout_evaluate(df: pd.DataFrame, label_col: str = "label"):
         df (pd.DataFrame): cleaned dataset
         label_col (str): preferred label column name
     """
-    # Detect columns the same way as in cv_evaluate
+    # Detect columns the same way as in cv_evaluate.
     y_col, text_col, num_cols = _detect_columns(df, label_hint=label_col)
 
-    # Build feature matrix X with numeric + optional text column
+    # Build feature matrix X with numeric + optional text column.
     X = df[[*(num_cols), *( [text_col] if text_col else [] )]].copy()
 
-    # Clean text column (no NaN, enforce string)
+    # Clean text column (no NaN, enforce string).
     if text_col:
         X[text_col] = X[text_col].fillna("").astype(str)
 
-    # Clean numeric columns (coerce to numeric and fill NaN with 0)
+    # Clean numeric columns (coerce to numeric and fill NaN with 0).
     if num_cols:
         for col in num_cols:
             X[col] = pd.to_numeric(X[col], errors="coerce")
         X[num_cols] = X[num_cols].fillna(0)
 
-    # Build label vector
+    # Build label vector.
     y = df[y_col].astype(int).values
 
-    # Build preprocessor and classifier for the hold-out pipeline
+    # Build preprocessor and classifier for the hold-out pipeline.
     pre = _preprocessor(num_cols, text_col)
     clf = LogisticRegression(max_iter=500)
     pipe = Pipeline([("pre", pre), ("clf", clf)])
 
-    # Split dataset into train (80%) and test (20%)
+    # Split dataset into train (80%) and test (20%).
     X_train, X_test, y_train, y_test = train_test_split(
         X,
         y,
@@ -340,17 +379,17 @@ def holdout_evaluate(df: pd.DataFrame, label_col: str = "label"):
         stratify=y if len(set(y)) > 1 else None,  # preserve class balance if possible
     )
 
-    # Fit pipeline on training data
+    # Fit pipeline on training data.
     pipe.fit(X_train, y_train)
 
-    # Predict labels on the test set
+    # Predict labels on the test set.
     y_pred = pipe.predict(X_test)
 
-    # Print confusion matrix: shows TP, TN, FP, FN
+    # Print confusion matrix: shows TP, TN, FP, FN.
     print("\n=== Hold-out Confusion Matrix (Logistic Regression) ===")
     print(confusion_matrix(y_test, y_pred))
 
-    # Print precision, recall, F1 per class
+    # Print precision, recall, F1 per class.
     print("\n=== Hold-out Classification Report (Logistic Regression) ===")
     print(classification_report(y_test, y_pred, digits=3))
 
@@ -368,7 +407,7 @@ def plot_roc_curves(df: pd.DataFrame, label_col: str = "label"):
         df (pd.DataFrame): cleaned dataset
         label_col (str): name of label column
     """
-    # Detect columns and build X/y with the same cleaning logic
+    # Detect columns and build X/y with the same cleaning logic.
     y_col, text_col, num_cols = _detect_columns(df, label_hint=label_col)
 
     X = df[[*(num_cols), *( [text_col] if text_col else [] )]].copy()
@@ -383,10 +422,10 @@ def plot_roc_curves(df: pd.DataFrame, label_col: str = "label"):
 
     y = df[y_col].astype(int).values
 
-    # Use the same preprocessing
+    # Use the same preprocessing as in cv_evaluate.
     pre = _preprocessor(num_cols, text_col)
 
-    # Define models again for ROC plotting
+    # Define models again for ROC plotting.
     models = {
         "LogReg": LogisticRegression(max_iter=500),
         "RandomForest": RandomForestClassifier(n_estimators=300, random_state=42),
@@ -402,7 +441,7 @@ def plot_roc_curves(df: pd.DataFrame, label_col: str = "label"):
         ),
     }
 
-    # Split once into train/test
+    # Split once into train/test.
     X_train, X_test, y_train, y_test = train_test_split(
         X,
         y,
@@ -413,27 +452,29 @@ def plot_roc_curves(df: pd.DataFrame, label_col: str = "label"):
 
     plt.figure()  # start a new figure
 
-    # Loop over models, fit, and plot ROC
+    # Loop over models, fit, and plot ROC.
     for name, model in models.items():
+        # Build the full pipeline for each model.
         pipe = Pipeline([("pre", pre), ("clf", model)])
         pipe.fit(X_train, y_train)
 
-        # Try to use predict_proba; if not available, fall back to decision_function
+        # Try to use predict_proba; if not available, fall back to decision_function.
         try:
             y_score = pipe.predict_proba(X_test)[:, 1]
         except Exception:
             y_score = pipe.decision_function(X_test)
 
+        # Compute ROC curve and AUC.
         fpr, tpr, _ = roc_curve(y_test, y_score)
         roc_auc = auc(fpr, tpr)
 
-        # Plot ROC curve (matplotlib will choose colours automatically)
+        # Plot ROC curve (matplotlib will choose colours automatically).
         plt.plot(fpr, tpr, label=f"{name} (AUC = {roc_auc:.3f})")
 
-    # Plot diagonal random-chance line
+    # Plot diagonal random-chance line.
     plt.plot([0, 1], [0, 1], linestyle="--")
 
-    # Axis labels and title
+    # Axis labels and title.
     plt.xlabel("False Positive Rate")
     plt.ylabel("True Positive Rate")
     plt.title("ROC Curves for Fake Profile Detection Models")
@@ -444,7 +485,12 @@ def plot_roc_curves(df: pd.DataFrame, label_col: str = "label"):
 
 # ------------------------- PCA Projection -------------------------
 
-def plot_pca_projection(df: pd.DataFrame, label_col: str = "label", n_components: int = 2, max_points: int = 5000):
+def plot_pca_projection(
+    df: pd.DataFrame,
+    label_col: str = "label",
+    n_components: int = 2,
+    max_points: int = 5000,
+):
     """
     Plot a 2D PCA projection of the numeric features, coloured by label.
 
@@ -458,40 +504,40 @@ def plot_pca_projection(df: pd.DataFrame, label_col: str = "label", n_components
         n_components (int): number of PCA components (2 by default for 2D scatter)
         max_points (int): max number of points to plot (for readability)
     """
+    # Detect columns and focus only on numeric ones for PCA.
     y_col, text_col, num_cols = _detect_columns(df, label_hint=label_col)
 
     if not num_cols:
         print("No numeric columns available for PCA projection.")
         return
 
-    # Work on a copy
+    # Work on a copy of the numeric columns.
     X_num = df[num_cols].copy()
 
-    # Clean numeric (same rules as before)
+    # Clean numeric (coerce to numeric, fill NaNs).
     for col in num_cols:
         X_num[col] = pd.to_numeric(X_num[col], errors="coerce")
     X_num = X_num.fillna(0)
 
-    # Scale numeric features before PCA
+    # Scale numeric features before PCA (mean=0, std=1).
     scaler = StandardScaler(with_mean=True, with_std=True)
     X_scaled = scaler.fit_transform(X_num)
 
-    # Apply PCA
+    # Apply PCA to reduce to n_components dimensions.
     pca = PCA(n_components=n_components, random_state=42)
     X_pca = pca.fit_transform(X_scaled)
 
-    # Prepare labels
+    # Prepare labels.
     y = df[y_col].astype(int).values
 
-    # Optionally subsample for readability
+    # Optionally subsample for readability if there are too many points.
     if len(y) > max_points:
-        # Randomly choose a subset of indices
         rng = np.random.default_rng(seed=42)
         idx = rng.choice(len(y), size=max_points, replace=False)
         X_pca = X_pca[idx]
         y = y[idx]
 
-    # Scatter plot for each class separately (matplotlib chooses colours)
+    # Scatter plot for each class separately (matplotlib chooses colours).
     plt.figure()
     for label_value in np.unique(y):
         mask = (y == label_value)
