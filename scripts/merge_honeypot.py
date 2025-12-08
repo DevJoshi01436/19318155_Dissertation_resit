@@ -1,142 +1,138 @@
+r"""
+Convert the original Social Honeypot TXT files into a clean CSV
+that is compatible with the Cresci 2017 merged dataset.
+
+Input (original dataset folder – change this path if needed):
+    C:\Users\devj0\Desktop\dataset\social_honeypot_icwsm_2011\social_honeypot_icwsm_2011
+
+We only use:
+    - content_polluters.txt      → label = 1 (fake/bot)
+    - legitimate_users.txt       → label = 0 (genuine)
+
+TXT format from the dataset README:
+    UserID \t CreatedAt \t CollectedAt \t NumberOfFollowings
+           \t NumberOfFollowers \t NumberOfTweets
+           \t LengthOfScreenName \t LengthOfDescriptionInUserProfile
+
+Output:
+    data/raw/social_honeypot_clean.csv
+    with columns: id, screen_name, followers_count,
+                  friends_count, status_count, description, label
 """
-merge_honeypot.py
 
-This script converts the Social Honeypot (ICWSM2011) dataset into a clean CSV
-that is compatible with the Cresci 2017 merged dataset and your ML pipeline.
-"""
+import os                     # for path handling
+import pandas as pd           # for tables / CSV reading & writing
 
-import pandas as pd          # pandas for dataframes and CSV loading
-import os                    # os for path joins
-import glob                  # glob for flexible file matching
+# ------------------------------------------------------------------
+# 1) POINT THIS TO YOUR HONEYPOT FOLDER
+# ------------------------------------------------------------------
+# The folder that contains content_polluters.txt and legitimate_users.txt.
+# >>> If you move the dataset somewhere else, UPDATE THIS PATH. <<<
+HONEYPOT_DIR = (
+    r"C:\Users\devj0\Desktop\dataset\social_honeypot_icwsm_2011"
+    r"\social_honeypot_icwsm_2011"
+)
 
-
-# Path where your honeypot dataset files live.
-# This should be the folder that contains:
-#   content_polluters
-#   content_polluters_followings
-#   legitimate_users
-#   legitimate_users_followings
-#   ...
-HONEYPOT_PATH = r"C:\Users\devj0\Desktop\dataset\social_honeypot_icwsm_2011\social_honeypot_icwsm_2011"
-
-# Output CSV file path (we save into data/raw/ inside your project)
-OUTPUT_PATH = r"data/raw/social_honeypot_clean.csv"
+# Where to save the cleaned CSV (inside your project)
+RAW_DIR = "data/raw"
+OUTPUT_CSV = os.path.join(RAW_DIR, "social_honeypot_clean.csv")
 
 
-def find_file(base_name: str) -> str:
+def load_honeypot_txt(file_name: str, label: int) -> pd.DataFrame:
     """
-    Find a file in HONEYPOT_PATH whose name starts with base_name.
-    This handles cases like:
-      - content_polluters
-      - content_polluters.txt
-      - content_polluters.csv
-    """
-    # Build a glob pattern like ".../content_polluters*"
-    pattern = os.path.join(HONEYPOT_PATH, base_name + "*")
-    # Find all matching paths
-    candidates = glob.glob(pattern)
-
-    # If nothing found, raise a clear error
-    if not candidates:
-        raise FileNotFoundError(f"No file found matching: {pattern}")
-
-    # Use the first match (there should normally be just one)
-    return candidates[0]
-
-
-def load_honeypot_file(base_name: str, label: int) -> pd.DataFrame:
-    """
-    Loads a honeypot text file (e.g., 'content_polluters' or 'legitimate_users')
-    and converts it to a dataframe with a label column.
+    Load one of the TXT files (content_polluters or legitimate_users)
+    and convert it into our standard schema.
 
     Args:
-        base_name (str): base file name without extension
-        label (int): 1 for bots, 0 for legitimate
+        file_name (str): base file name, e.g. "content_polluters.txt"
+        label (int): 1 for bots, 0 for genuine
 
     Returns:
-        pd.DataFrame
+        pd.DataFrame with columns:
+            id, screen_name, followers_count, friends_count,
+            status_count, description, label
     """
-    # Find the actual file path (with or without extension)
-    file_path = find_file(base_name)
+    # Build the full path to the TXT file
+    path = os.path.join(HONEYPOT_DIR, file_name)
 
-    # Read the file, letting pandas guess the delimiter (tab, comma, etc.)
-    df = pd.read_csv(file_path, sep=None, engine="python")
+    if not os.path.exists(path):
+        # Fail fast if the file isn’t there
+        raise FileNotFoundError(f"❌ Could not find file: {path}")
 
-    # Add label column
-    df["label"] = label
+    print(f"✓ Loading honeypot file: {path}")
 
-    print(f"Loaded {os.path.basename(file_path)}: {len(df)} rows, label={label}")
-    return df
+    # Column names from the official README
+    col_names = [
+        "UserID",
+        "CreatedAt",
+        "CollectedAt",
+        "NumberOfFollowings",
+        "NumberOfFollowers",
+        "NumberOfTweets",
+        "LengthOfScreenName",
+        "LengthOfDescriptionInUserProfile",
+    ]
+
+    # Read a tab-separated file with NO header row
+    df_raw = pd.read_csv(
+        path,
+        sep="\t",          # values are separated by tab characters
+        header=None,       # there is no header line in the file
+        names=col_names,   # assign our own column names
+        encoding="utf-8",  # safe default
+        engine="python",   # robust parser for messy text
+    )
+
+    # Map the columns into our unified schema.
+    # We do not have the real screen_name or description text here,
+    # only their lengths, so we leave those as empty / None.
+    df_std = pd.DataFrame(
+        {
+            "id": df_raw["UserID"],
+            "screen_name": None,                         # unknown in this dataset
+            "followers_count": df_raw["NumberOfFollowers"],
+            "friends_count": df_raw["NumberOfFollowings"],
+            "status_count": df_raw["NumberOfTweets"],
+            "description": None,                         # only length is provided
+            "label": label,                              # 1 = bot, 0 = genuine
+        }
+    )
+
+    print(
+        f"  -> rows loaded: {len(df_std):,} | "
+        f"label = {label} ({'bots' if label == 1 else 'genuine'})"
+    )
+
+    return df_std
 
 
-def standardize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Renames Social Honeypot columns to match the Cresci dataset.
-    Some columns may not exist, so we create placeholders where needed.
-    """
-    # Map various possible original column names to your unified ones
-    column_map = {
-        "id": "id",
-        "user_id": "id",
-        "userid": "id",
-        "username": "screen_name",
-        "screen_name": "screen_name",
-        "description": "description",
-        "bio": "description",
-        "followers": "followers_count",
-        "followers_count": "followers_count",
-        "friends": "friends_count",
-        "friends_count": "friends_count",
-        "statuses": "status_count",
-        "status_count": "status_count",
-        "tweets": "status_count",
-    }
+def main() -> None:
+    """Main function: load both TXT files, combine, deduplicate, save CSV."""
+    print("\n=== Building social_honeypot_clean.csv from TXT files ===\n")
 
-    # Apply the rename where names match
-    df = df.rename(columns=column_map)
+    # 1) Load bots (content polluters)
+    bots = load_honeypot_txt("content_polluters.txt", label=1)
 
-    # For any expected column that is missing, create an empty one
-    for col in ["id", "screen_name", "followers_count", "friends_count", "status_count", "description"]:
-        if col not in df.columns:
-            df[col] = None
+    # 2) Load genuine users
+    legit = load_honeypot_txt("legitimate_users.txt", label=0)
 
-    # Ensure description is string and replace NaN with empty string
-    df["description"] = df["description"].fillna("").astype(str)
+    # 3) Combine them into one table
+    combined = pd.concat([bots, legit], ignore_index=True)
+    print(f"\n✓ Combined rows (before dedupe): {len(combined):,}")
 
-    # Return only the columns your pipeline uses (plus label)
-    return df[["id", "screen_name", "followers_count", "friends_count", "status_count", "description", "label"]]
+    # 4) Drop duplicate user IDs if any
+    before = len(combined)
+    combined = combined.drop_duplicates(subset="id")
+    after = len(combined)
+    print(f"✓ Deduplicated on 'id': {before:,} → {after:,} unique users")
 
+    # 5) Ensure output folder exists
+    os.makedirs(RAW_DIR, exist_ok=True)
 
-def main():
-    """Main function to load, clean, merge and save the honeypot dataset."""
-    print("\n=== Processing Social Honeypot Dataset ===\n")
-
-    # Load bot (content polluters) and legitimate user files
-    bots = load_honeypot_file("content_polluters", label=1)
-    real = load_honeypot_file("legitimate_users", label=0)
-
-    # Standardize both to common column names
-    bots_clean = standardize_columns(bots)
-    real_clean = standardize_columns(real)
-
-    # Combine bots + real users into a single dataframe
-    full = pd.concat([bots_clean, real_clean], ignore_index=True)
-
-    # Deduplicate by id (if available), otherwise by screen_name
-    before = len(full)
-    if "id" in full.columns:
-        full = full.drop_duplicates(subset=["id"])
-    elif "screen_name" in full.columns:
-        full = full.drop_duplicates(subset=["screen_name"])
-    after = len(full)
-
-    print(f"\nDeduplicated: {before} -> {after} rows")
-
-    # Save final CSV into your project
-    os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
-    full.to_csv(OUTPUT_PATH, index=False, encoding="utf-8")
-    print(f"\n✅ Saved cleaned dataset: {OUTPUT_PATH}")
-    print(f"Rows: {len(full)} | Columns: {list(full.columns)}\n")
+    # 6) Save to CSV
+    combined.to_csv(OUTPUT_CSV, index=False)
+    print(f"\n✅ Saved cleaned honeypot CSV to: {OUTPUT_CSV}")
+    print(f"   Final row count: {len(combined):,}\n")
 
 
 if __name__ == "__main__":
