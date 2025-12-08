@@ -23,11 +23,11 @@ from sklearn.feature_extraction.text import TfidfVectorizer   # To turn text int
 # Model selection and evaluation tools
 from sklearn.model_selection import StratifiedKFold, cross_validate, train_test_split
 from sklearn.metrics import (
-    get_scorer,
-    classification_report,
-    confusion_matrix,
-    roc_curve,
-    auc,
+    get_scorer,                      # factory for standard metric scorers
+    classification_report,           # detailed per-class metrics
+    confusion_matrix,                # confusion matrix (TP, FP, TN, FN)
+    roc_curve,                       # compute ROC points
+    auc,                             # compute area under ROC
 )
 
 # Machine learning models
@@ -172,26 +172,32 @@ def build_cv_pipelines(num_cols, text_col):
     pre = _preprocessor(num_cols, text_col)
 
     # Define the classifiers we want to test.
+    # NOTE: n_estimators and folds have been kept moderate for speed on a laptop.
     models = {
         # Logistic Regression: linear baseline, good as a reference model.
         "logreg": LogisticRegression(max_iter=500),
 
-        # Random Forest: ensemble of decision trees, handles nonlinear patterns and interactions.
+        # Random Forest: ensemble of decision trees, handles nonlinear patterns.
+        # Reduced n_estimators and n_jobs=-1 to make it faster on your machine.
         "rf": RandomForestClassifier(
-            n_estimators=300,
-            random_state=42
+            n_estimators=100,    # was 300: reduce for faster training
+            random_state=19318155,
+            n_jobs=-1,           # use all available CPU cores
         ),
 
         # XGBoost: gradient boosting on decision trees, strong for tabular data.
+        # Reduced n_estimators and using 'hist' tree_method for speed.
         "xgb": XGBClassifier(
-            n_estimators=400,
+            n_estimators=200,     # was 400: reduce for faster training
             max_depth=6,
             learning_rate=0.1,
             subsample=0.9,
             colsample_bytree=0.9,
             objective="binary:logistic",
             eval_metric="logloss",
-            random_state=42,
+            tree_method="hist",   # faster algorithm on CPU
+            n_jobs=-1,            # use all cores
+            random_state=19318155,
         ),
     }
 
@@ -248,7 +254,7 @@ def cv_evaluate(df: pd.DataFrame, label_col: str = "label"):
     # 3. Build label vector y as integer array.
     y = df[y_col].astype(int).values
 
-    # 4. Configure Stratified K-Fold CV SAFELY (this is where your error came from).
+    # 4. Configure Stratified K-Fold CV SAFELY.
     #
     # We must ensure:
     #   - There are at least 2 classes (0 and 1)
@@ -266,7 +272,7 @@ def cv_evaluate(df: pd.DataFrame, label_col: str = "label"):
     # Smallest class size (e.g., min(#bots, #genuine)).
     min_class = int(counts.min())
 
-    # Also check overall sample size.
+    # Overall sample size.
     total_samples = len(y)
 
     # If the smallest class has < 2 samples, we cannot do stratified CV with >=2 splits.
@@ -279,10 +285,10 @@ def cv_evaluate(df: pd.DataFrame, label_col: str = "label"):
         )
 
     # Choose number of folds:
-    # - Max 5 folds for stability.
+    # - Max 3 folds (kept smaller than 5 to improve runtime on large datasets)
     # - Cannot exceed the smallest class size.
     # - Cannot exceed total number of samples.
-    n_splits = min(5, min_class, total_samples)
+    n_splits = min(3, min_class, total_samples)
 
     # Extra safety: n_splits must be at least 2.
     if n_splits < 2:
@@ -295,7 +301,7 @@ def cv_evaluate(df: pd.DataFrame, label_col: str = "label"):
     cv = StratifiedKFold(
         n_splits=n_splits,
         shuffle=True,
-        random_state=42,
+        random_state=19318155,
     )
 
     # 5. Build pipelines for each model.
@@ -314,6 +320,7 @@ def cv_evaluate(df: pd.DataFrame, label_col: str = "label"):
             cv=cv,               # CV splitter
             scoring=SCORERS,     # metrics to compute
             error_score=np.nan,  # if a fold crashes, store NaN instead of raising
+            n_jobs=-1,           # run folds in parallel where possible
         )
 
         # For each "test_*" metric, compute mean and std across folds.
@@ -375,7 +382,7 @@ def holdout_evaluate(df: pd.DataFrame, label_col: str = "label"):
         X,
         y,
         test_size=0.2,
-        random_state=42,
+        random_state=19318155,
         stratify=y if len(set(y)) > 1 else None,  # preserve class balance if possible
     )
 
@@ -410,34 +417,44 @@ def plot_roc_curves(df: pd.DataFrame, label_col: str = "label"):
     # Detect columns and build X/y with the same cleaning logic.
     y_col, text_col, num_cols = _detect_columns(df, label_hint=label_col)
 
+    # Build feature matrix with numeric + optional text.
     X = df[[*(num_cols), *( [text_col] if text_col else [] )]].copy()
 
+    # Clean text: fill NaN and cast to str.
     if text_col:
         X[text_col] = X[text_col].fillna("").astype(str)
 
+    # Clean numeric: coerce to numeric and fill NaN.
     if num_cols:
         for col in num_cols:
             X[col] = pd.to_numeric(X[col], errors="coerce")
         X[num_cols] = X[num_cols].fillna(0)
 
+    # Build label vector.
     y = df[y_col].astype(int).values
 
     # Use the same preprocessing as in cv_evaluate.
     pre = _preprocessor(num_cols, text_col)
 
-    # Define models again for ROC plotting.
+    # Define models again for ROC plotting (same lighter settings).
     models = {
         "LogReg": LogisticRegression(max_iter=500),
-        "RandomForest": RandomForestClassifier(n_estimators=300, random_state=42),
+        "RandomForest": RandomForestClassifier(
+            n_estimators=100,
+            random_state=19318155,
+            n_jobs=-1,
+        ),
         "XGBoost": XGBClassifier(
-            n_estimators=400,
+            n_estimators=200,
             max_depth=6,
             learning_rate=0.1,
             subsample=0.9,
             colsample_bytree=0.9,
             objective="binary:logistic",
             eval_metric="logloss",
-            random_state=42,
+            tree_method="hist",
+            n_jobs=-1,
+            random_state=19318155,
         ),
     }
 
@@ -446,7 +463,7 @@ def plot_roc_curves(df: pd.DataFrame, label_col: str = "label"):
         X,
         y,
         test_size=0.2,
-        random_state=42,
+        random_state=19318155,
         stratify=y if len(set(y)) > 1 else None,
     )
 
